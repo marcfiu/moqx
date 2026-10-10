@@ -35,6 +35,15 @@ MATCHER_P(HasChainDataLengthOf, n, "") {
   return arg->computeChainDataLength() == uint64_t(n);
 }
 
+// The bytes of a payload chain, in chain order
+std::string chainBytes(const folly::IOBuf& buf) {
+  std::string out;
+  for (auto range : buf) {
+    out.append(reinterpret_cast<const char*>(range.data()), range.size());
+  }
+  return out;
+}
+
 // Helper to create extensions with Prior Object ID Gap
 Extensions makeObjectGapExtensions(uint64_t gap) {
   Extensions ext;
@@ -1440,6 +1449,74 @@ CO_TEST_F(MoqxCacheTest, TestUpstreamFetchUsingBeginObjectAndObjectPayload) {
   auto res = co_await cache_.fetch(getFetch({0, 0}, {0, 2}), trackingConsumer_, upstream_);
   EXPECT_TRUE(res.hasValue());
   EXPECT_EQ(res.value()->fetchOk().endLocation, (AbsoluteLocation{0, 0}));
+}
+
+// An object written as beginObject plus several objectPayload chunks has to
+// come back from the cache with its bytes in arrival order, not just at the
+// right length.  Appending each chunk after the head buffer instead of at the
+// tail stores A, D, C, B.
+CO_TEST_F(MoqxCacheTest, TestSubgroupWritebackKeepsMultiChunkPayloadInOrder) {
+  auto writeback = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
+  auto subgroupConsumer = writeback->beginSubgroup(0, 0, 0).value();
+  EXPECT_FALSE(
+      subgroupConsumer->beginObject(0, 40, folly::IOBuf::copyBuffer("AAAAAAAAAA")).hasError()
+  );
+  EXPECT_FALSE(
+      subgroupConsumer->objectPayload(folly::IOBuf::copyBuffer("BBBBBBBBBB"), false).hasError()
+  );
+  EXPECT_FALSE(
+      subgroupConsumer->objectPayload(folly::IOBuf::copyBuffer("CCCCCCCCCC"), false).hasError()
+  );
+  EXPECT_FALSE(
+      subgroupConsumer->objectPayload(folly::IOBuf::copyBuffer("DDDDDDDDDD"), false).hasError()
+  );
+  writeback.reset();
+
+  std::string fetched;
+  EXPECT_CALL(*consumer_, object(0, 0, 0, _, _, _, _))
+      .WillOnce([&fetched](auto, auto, auto, auto payload, const auto&, auto, auto) {
+        fetched = chainBytes(*payload);
+        return folly::unit;
+      });
+  auto res = co_await cache_.fetch(getFetch({0, 0}, {0, 1}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  co_await folly::coro::co_reschedule_on_current_executor;
+  EXPECT_EQ(fetched, "AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDD");
+}
+
+// The same for an object cached from an upstream FETCH.
+CO_TEST_F(MoqxCacheTest, TestFetchWritebackKeepsMultiChunkPayloadInOrder) {
+  expectUpstreamFetch({0, 0}, {0, 1}, 0, AbsoluteLocation{0, 1});
+  auto res = co_await cache_.fetch(getFetch({0, 0}, {0, 1}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+
+  {
+    testing::InSequence enforceOrder;
+    EXPECT_CALL(*consumer_, beginObject(0, 0, 0, 40, _, _)).WillOnce(Return(folly::unit));
+    EXPECT_CALL(*consumer_, objectPayload(_, false))
+        .Times(2)
+        .WillRepeatedly(Return(ObjectPublishStatus::IN_PROGRESS));
+    EXPECT_CALL(*consumer_, objectPayload(_, true)).WillOnce(Return(ObjectPublishStatus::DONE));
+  }
+  upstreamFetchConsumer_->beginObject(0, 0, 0, 40, folly::IOBuf::copyBuffer("AAAAAAAAAA"));
+  upstreamFetchConsumer_->objectPayload(folly::IOBuf::copyBuffer("BBBBBBBBBB"), false);
+  upstreamFetchConsumer_->objectPayload(folly::IOBuf::copyBuffer("CCCCCCCCCC"), false);
+  upstreamFetchConsumer_->objectPayload(folly::IOBuf::copyBuffer("DDDDDDDDDD"), true);
+
+  co_await folly::coro::co_reschedule_on_current_executor;
+  EXPECT_TRUE(cache_.hasCachedObject(kTestTrackName, AbsoluteLocation{0, 0}));
+
+  // Served from cache this time.
+  std::string fetched;
+  EXPECT_CALL(*consumer_, object(0, 0, 0, _, _, _, _))
+      .WillOnce([&fetched](auto, auto, auto, auto payload, const auto&, auto, auto) {
+        fetched = chainBytes(*payload);
+        return folly::unit;
+      });
+  auto res2 = co_await cache_.fetch(getFetch({0, 0}, {0, 1}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res2.hasValue());
+  co_await folly::coro::co_reschedule_on_current_executor;
+  EXPECT_EQ(fetched, "AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDD");
 }
 
 CO_TEST_F(MoqxCacheTest, TestObjectPayloadMarksRemainingAsNonexistent) {
